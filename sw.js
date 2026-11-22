@@ -1,6 +1,6 @@
 // 앱 파일을 기기에 저장해 두고 오프라인에서도 연다.
 // 인터넷이 되면 늘 새 파일을 먼저 받고(그래서 고친 내용이 바로 보인다), 안 되면 저장본을 쓴다.
-const VERSION = 'v33';
+const VERSION = 'v34';
 const FILES = ['./', 'index.html', 'app.js', 'analyze.js', 'icons.js', 'sync.js', 'manifest.webmanifest',
   'vendor/pdf.min.mjs', 'vendor/SUIT-Variable.woff2', 'vendor/pdf.worker.min.mjs', 'vendor/firebase-app.js', 'vendor/firebase-auth.js', 'vendor/firebase-firestore-lite.js', 'icon-180.png', 'icon-192.png', 'icon-512.png', 'icon-round-192.png'];
 

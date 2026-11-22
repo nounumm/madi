@@ -32,7 +32,7 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --background: #09090b; --foreground: #fafafa; --card: #18181b; --muted: #27272a; --muted-foreground: #a1a1aa;
-    --border: #27272a; --input: #3f3f46; --ring: #52525b; --secondary: #27272a; --primary-soft: rgba(112, 152, 250, .28); --primary-strong: #8fb0ff;
+    --border: #27272a; --input: #3f3f46; --ring: #52525b; --secondary: #27272a; --primary: #4f7cf0; --primary-soft: rgba(112, 152, 250, .28); --primary-strong: #8fb0ff;
   }
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -63,6 +63,7 @@ select option { background: var(--card); color: var(--foreground); }
 #library { max-width: 800px; margin: 0 auto; padding: calc(env(safe-area-inset-top) + 28px) 16px 40px; }
 #library header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
 #library h1 { font-size: 24px; font-weight: 600; letter-spacing: -.02em; margin: 0; flex: 1; }
+#add { font-weight: 700; }
 .list { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
 .card { position: relative; background: var(--card); border: 1px solid var(--border); border-radius: calc(var(--radius) + 4px);
         box-shadow: var(--shadow-sm); overflow: hidden; display: flex; flex-direction: column; }
@@ -223,7 +224,7 @@ button.select .icon { color: var(--muted-foreground); }
 #pager button.on { background: var(--background); border-color: var(--input); box-shadow: var(--shadow-xs); font-weight: 600; }
 #pager button.shown { color: var(--primary-strong); }
 #pager .count { color: var(--muted-foreground); font-size: 13px; margin-left: 8px; white-space: nowrap; }
-.jump { position: absolute; background: var(--jump); color: var(--jump-foreground); font-size: 12px; font-weight: 600; padding: 1px 6px; border-radius: 6px;
+.jump { position: absolute; background: var(--jump); color: var(--jump-foreground); font-size: 12px; font-weight: 700; padding: 1px 6px; border-radius: 6px;
         white-space: nowrap; pointer-events: none; display: none; z-index: 2; }
 </style>
 </head>
