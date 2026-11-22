@@ -1,6 +1,7 @@
 import * as pdfjs from './vendor/pdf.min.mjs';
 import { analyzePdf, parseOrder } from './analyze.js';
 import { icon } from './icons.js';
+import * as sync from './sync.js';
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL('./vendor/pdf.worker.min.mjs', import.meta.url).href;
 const $ = id => document.getElementById(id);
@@ -16,12 +17,14 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
 // ---------- 저장소 (IndexedDB) ----------
 
 const dbReady = new Promise((res, rej) => {
-  const r = indexedDB.open('score-player', 2);
+  const r = indexedDB.open('score-player', 3);
   r.onupgradeneeded = () => {
     const db = r.result;
     if (!db.objectStoreNames.contains('scores')) db.createObjectStore('scores', { keyPath: 'id' });
     // 연습 기록은 PDF 내용(해시)으로 묶는다. 같은 파일이면 이름이 달라도, 다른 기기에서도 같은 곡
     if (!db.objectStoreNames.contains('practice')) db.createObjectStore('practice', { keyPath: 'key' });
+    // 다른 기기에서 친 기록(서버에서 받은 합계). 이 기기 기록(practice)과 따로 두고 보여 줄 때 더한다
+    if (!db.objectStoreNames.contains('remote')) db.createObjectStore('remote', { keyPath: 'key' });
   };
   r.onsuccess = () => res(r.result);
   r.onerror = () => rej(r.error);
@@ -134,7 +137,7 @@ async function renderLibrary() {
     const sub = el('div', 'sub');
     sub.textContent = a.error ? a.error : `${a.pages.length}쪽 · ${a.measures.length}마디 · ♩=${s.bpm}`;
     const keyP = ensureHash(s);
-    if (!a.error) keyP.then(getPractice).then(pr => {
+    if (!a.error) keyP.then(viewPractice).then(pr => {
       if (!pr || pr.seconds < 1) return;
       const t = el('div', 'sub practiced'); t.textContent = `연습 ${fmtDur(pr.seconds)}`; meta.append(t);
       const rb = el('button', 'rec-btn'); rb.textContent = '기록';
@@ -167,6 +170,23 @@ async function renderLibrary() {
 // ---------- 연습 기록 (홈 요약, 곡별 기록 화면) ----------
 
 const getAllPractice = () => store('readonly', s => s.getAll(), 'practice');
+const getRemote = key => store('readonly', s => s.get(key), 'remote');
+const allRemote = () => store('readonly', s => s.getAll(), 'remote');
+const setRemote = list => store('readwrite', s => { s.clear(); for (const r of list) s.put(r); }, 'remote');
+// 두 기록을 더한다. 마디 횟수, 시간, 날짜별 시간 모두 합
+function addRec(a, b) {
+  if (!a) return b; if (!b) return a;
+  const sum = (x = {}, y = {}) => { const o = { ...x }; for (const k in y) o[k] = (o[k] || 0) + y[k]; return o; };
+  return { key: a.key, title: a.title || b.title, counts: sum(a.counts, b.counts), seconds: (a.seconds || 0) + (b.seconds || 0), days: sum(a.days, b.days) };
+}
+// 화면에 보여 줄 기록 = 이 기기 + 다른 기기
+const viewPractice = async key => addRec(await getPractice(key), await getRemote(key).catch(() => null));
+async function viewAllPractice() {
+  const own = await getAllPractice(), remote = await allRemote().catch(() => []);
+  const map = new Map(own.map(p => [p.key, p]));
+  for (const r of remote) map.set(r.key, addRec(map.get(r.key), r));
+  return [...map.values()];
+}
 // 오늘부터 거꾸로 n일의 날짜 (오래된 날이 앞)
 function lastDays(n) {
   const out = [], d = new Date();
@@ -203,7 +223,7 @@ const dayItems = (days, n, labelOf) => lastDays(n).map((d, i, arr) => ({
 // 보관함 맨 위: 최근 7일 요약. 기록이 없으면 숨긴다
 async function renderSummary(scores) {
   const box = $('summary');
-  const recs = (await getAllPractice()).filter(p => p.seconds >= 1);
+  const recs = (await viewAllPractice()).filter(p => p.seconds >= 1);
   if (!recs.length) { $('recentSec').hidden = true; return; }
   const titleOf = key => (scores.find(s => (s.hash || s.id) === key) || {}).title;
   const keys = lastDays(7).map(d => dayKey(d));
@@ -225,7 +245,7 @@ let recTask = null, recId = null;
 async function openRecord(id) {
   const s = await getScore(id);
   const key = await ensureHash(s);
-  const pr = (await getPractice(key)) || { counts: {}, seconds: 0, days: {} };
+  const pr = (await viewPractice(key)) || { counts: {}, seconds: 0, days: {} };
   const a = s.analysis;
   recId = id;
   $('recTitle').textContent = s.title;
@@ -328,11 +348,12 @@ function trackPractice(t) {
 async function flushPractice() {
   if (!practice || !practiceDirty) return;
   practiceDirty = false;
-  practice.updated = Date.now();
-  try { await putPractice(practice); } catch { practiceDirty = true; }
+  const p = practice;  // 곡을 닫으면 practice가 바로 비워지므로 붙잡아 둔다
+  p.updated = Date.now();
+  try { await putPractice(p); markPending(p.key); } catch { practiceDirty = true; }
 }
-addEventListener('pagehide', () => flushPractice());
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushPractice(); });
+addEventListener('pagehide', () => syncSoon());
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') syncSoon(); else pullIfStale(); });
 
 const pref = (k, v) => { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch { return null; } };
 
@@ -383,7 +404,7 @@ async function openScore(id) {
 function closeScore() {
   if (playing) pause();
   setMenu(false);
-  flushPractice(); practice = null;
+  syncSoon().then(pullIfStale); practice = null;
   docTask && docTask.destroy(); doc = docTask = null; M = null;
   $('stage').replaceChildren();
   $('player').hidden = true; $('library').hidden = false;
@@ -481,7 +502,7 @@ function play() {
   keepAwake(true);
   requestAnimationFrame(tick);
 }
-function stopTracking() { trackPractice(timeNow()); trackIdx = -1; lastClock = null; clearInterval(flushTimer); flushPractice(); }
+function stopTracking() { trackPractice(timeNow()); trackIdx = -1; lastClock = null; clearInterval(flushTimer); syncSoon(); }
 function pause() {
   stopTracking();
   const [i] = where(timeNow());
@@ -825,12 +846,121 @@ addEventListener('keydown', e => {
   else if (e.key === 'ArrowDown') { e.preventDefault(); setBpm(bpm - 2); }
 });
 
+// ---------- 로그인과 기록 동기화 ----------
+// 기록은 늘 이 기기에 먼저 저장하고, 로그인돼 있고 인터넷이 될 때 서버에 올린다.
+// 못 올린 곡은 「올릴 목록」에 남겨 두었다가 다음 기회(멈춤, 곡 끝, 앱 닫기·열기, 인터넷 연결)에 올린다.
+const deviceId = (() => {
+  let id = pref('deviceId');
+  if (!id) { id = Date.now().toString(36) + Math.random().toString(36).slice(2, 10); pref('deviceId', id); }
+  return id;
+})();
+const pendingKeys = () => { try { return JSON.parse(pref('syncPending') || '[]'); } catch { return []; } };
+const setPending = keys => pref('syncPending', JSON.stringify([...new Set(keys)]));
+function markPending(key) { if (!pendingKeys().includes(key)) setPending([...pendingKeys(), key]); }
+
+let user = null, syncing = null, lastSync = Number(pref('lastSync')) || 0, syncError = '';
+// 이 기기에서 못 올린 기록을 올린다
+async function pushPending() {
+  const keys = pendingKeys();
+  if (!keys.length) return;
+  const recs = (await Promise.all(keys.map(getPractice))).filter(Boolean);
+  await sync.push(user.uid, deviceId, recs);
+  setPending(pendingKeys().filter(k => !keys.includes(k)));  // 올리는 사이 새로 생긴 건 남긴다
+}
+// 서버에서 다른 기기 기록을 받아 합계로 저장한다 (이 기기 칸은 빼고)
+async function pullRemote() {
+  const list = [];
+  for (const d of await sync.pull(user.uid)) {
+    let r = null;
+    for (const [dev, v] of Object.entries(d.by)) if (dev !== deviceId) r = addRec(r, { key: d.key, title: d.title, ...v });
+    if (r) list.push({ key: d.key, title: d.title || r.title, counts: r.counts, seconds: r.seconds, days: r.days });
+  }
+  await setRemote(list);
+}
+// pull: 다른 기기 기록도 받아 올지. 앱을 열 때·로그인할 때·보관함으로 돌아올 때
+function syncNow(pull = false) {
+  if (!user || !navigator.onLine) { renderAccount(); return Promise.resolve(); }
+  if (syncing) return syncing.then(() => pull && syncNow(true));
+  syncing = (async () => {
+    try {
+      await pushPending();
+      if (pull) { await pullRemote(); if (!$('library').hidden) renderLibrary(); }
+      lastSync = Date.now(); pref('lastSync', String(lastSync)); syncError = '';
+    } catch (e) { syncError = sync.errorText(e); }
+    finally { syncing = null; renderAccount(); }
+  })();
+  return syncing;
+}
+const syncSoon = () => flushPractice().then(() => syncNow());
+let lastPull = 0;
+// 보관함을 다시 볼 때마다 서버를 부르지 않도록 1분에 한 번만
+function pullIfStale() { if (Date.now() - lastPull > 60000) { lastPull = Date.now(); syncNow(true); } }
+addEventListener('online', () => syncNow(true));
+
+sync.onUser(async u => {
+  user = u;
+  if (u && pref('syncUid') !== u.uid) {
+    // 이 기기에서 이 계정으로 처음 로그인: 지금까지 이 기기에서 친 기록을 모두 올린다
+    setPending((await getAllPractice()).map(p => p.key));
+    pref('syncUid', u.uid);
+  }
+  if (!u) { await setRemote([]).catch(() => {}); if (!$('library').hidden) renderLibrary(); }
+  renderAccount();
+  if (u) { lastPull = Date.now(); syncNow(true); }
+});
+
+// 보관함 오른쪽 위 계정 버튼과 대화상자
+const ago = t => {
+  const m = Math.floor((Date.now() - t) / 60000);
+  if (m < 1) return '방금'; if (m < 60) return `${m}분 전`;
+  const d = new Date(t); return `${d.getMonth() + 1}월 ${d.getDate()}일 ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
+function renderAccount() {
+  const b = $('account');
+  b.textContent = user ? user.email.split('@')[0] : '로그인';
+  b.classList.toggle('signed', !!user);
+  $('acctOut').hidden = !!user; $('acctIn').hidden = !user;
+  if (!user) return;
+  $('acctEmail').textContent = user.email;
+  const wait = pendingKeys().length;
+  $('acctStatus').textContent = syncing ? '동기화하는 중…'
+    : syncError ? syncError
+    : !navigator.onLine ? `인터넷이 연결되면 올립니다${wait ? ` (${wait}곡 대기)` : ''}.`
+    : lastSync ? `마지막 동기화: ${ago(lastSync)}` : '아직 동기화하지 않았습니다.';
+  $('acctStatus').classList.toggle('err', !!syncError);
+}
+function acctMsg(t) { $('acctErr').textContent = t || ''; }
+async function acctRun(fn) {
+  const form = $('acctOut');
+  form.querySelectorAll('button').forEach(b => b.disabled = true); acctMsg('');
+  try { await fn(); } catch (e) { acctMsg(sync.errorText(e)); }
+  finally { form.querySelectorAll('button').forEach(b => b.disabled = false); }
+}
+$('account').onclick = () => { acctMsg(''); renderAccount(); $('acct').showModal(); };
+$('acctClose').onclick = () => $('acct').close();
+$('acct').addEventListener('click', e => { if (e.target === $('acct')) $('acct').close(); });  // 바깥 누르면 닫기
+$('acctOut').onsubmit = e => {
+  e.preventDefault();
+  acctRun(async () => { await sync.signIn($('acctMail').value.trim(), $('acctPw').value); $('acctPw').value = ''; });
+};
+$('acctSignup').onclick = () => acctRun(async () => {
+  await sync.signUp($('acctMail').value.trim(), $('acctPw').value); $('acctPw').value = '';
+});
+$('acctReset').onclick = () => acctRun(async () => {
+  const mail = $('acctMail').value.trim();
+  if (!mail) { acctMsg('이메일을 먼저 입력해 주세요.'); return; }
+  await sync.resetPassword(mail); acctMsg('비밀번호 재설정 메일을 보냈습니다.');
+});
+$('acctSync').onclick = () => syncNow(true);
+$('acctLogout').onclick = async () => { await sync.logOut(); $('acct').close(); };
+renderAccount();
+
 renderLibrary();
 
 // 시험용 손잡이 (화면 동작에는 쓰지 않음)
 window.scoreApp = {
   addFiles, openScore, allScores,
   get state() { return { playing, songTime, seq, starts, durs, layoutKey, slots, bpm }; },
-  get practice() { return practice; }, flushPractice, openRecord, closeRecord, renderLibrary,
+  get practice() { return practice; }, flushPractice, openRecord, syncNow, viewAllPractice, deviceId, closeRecord, renderLibrary,
   setClock(c) { ctx = c; }, play, pause, render, schedule, setBpm, moveTo, goToPage
 };
