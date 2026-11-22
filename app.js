@@ -66,16 +66,7 @@ async function addFiles(files) {
     busy.hidden = false;
     busy.textContent = `「${f.name}」 읽는 중…`;
     try {
-      const buf = await f.arrayBuffer();
-      const task = pdfjs.getDocument({ data: new Uint8Array(buf.slice(0)) });
-      const d = await task.promise;
-      const a = await analyzePdf(d, pdfjs.OPS);
-      const thumb = await makeThumb(d);
-      task.destroy();
-      const id = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now() + Math.random());
-      const hash = await pdfHash(buf);
-      await putScore({ id, hash, title: f.name.replace(/\.pdf$/i, ''), pdf: buf, analysis: a, thumb,
-                       order: a.order, bpm: a.bpm, click: true, countin: true, added: Date.now() });
+      await importPdf(await f.arrayBuffer(), f.name.replace(/\.pdf$/i, ''));
     } catch (e) {
       errors.push(`「${f.name}」을 읽지 못했습니다 (${e.message})`);
     }
@@ -83,6 +74,20 @@ async function addFiles(files) {
   busy.hidden = !errors.length;
   busy.textContent = errors.join('\n');
   await renderLibrary();
+  syncNow(true);  // 로그인돼 있으면 새 악보를 올린다
+}
+// PDF를 읽어 보관함에 넣는다. extra: 다른 기기에서 받은 설정(bpm, 순서 등)
+async function importPdf(buf, title, extra = {}) {
+  const task = pdfjs.getDocument({ data: new Uint8Array(buf.slice(0)) });
+  const d = await task.promise;
+  const a = await analyzePdf(d, pdfjs.OPS);
+  const thumb = await makeThumb(d);
+  task.destroy();
+  const id = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now() + Math.random());
+  const hash = await pdfHash(buf);
+  const now = Date.now();
+  await putScore({ id, hash, title, pdf: buf, analysis: a, thumb,
+                   order: a.order, bpm: a.bpm, click: true, countin: true, added: now, updated: now, ...extra });
 }
 
 // 보관함 카드용 첫 쪽 미리보기 (가로 360px JPEG)
@@ -155,7 +160,10 @@ async function renderLibrary() {
         const key = await keyP;
         await delScore(s.id);
         // 같은 PDF가 보관함에 하나 더 있으면 기록은 남긴다
-        if (!scores.some(o => o.id !== s.id && (o.hash || o.id) === key)) await delPractice(key);
+        if (!scores.some(o => o.id !== s.id && (o.hash || o.id) === key)) {
+          await delPractice(key);
+          queueScoreDelete(key);  // 로그인돼 있으면 서버와 다른 기기에서도 지운다
+        }
         renderLibrary(); return;
       }
       del.classList.add('armed'); del.textContent = '삭제할까요?';
@@ -412,7 +420,7 @@ function closeScore() {
 }
 $('back').onclick = closeScore;
 
-const save = patch => { Object.assign(rec, patch); putScore(rec); };
+const save = patch => { Object.assign(rec, patch, { updated: Date.now() }); putScore(rec); };
 function setTog(id, on) { $(id).setAttribute('aria-pressed', on ? 'true' : 'false'); }
 const isOn = id => $(id).getAttribute('aria-pressed') === 'true';
 for (const id of ['click', 'countin']) $(id).onclick = () => { setTog(id, !isOn(id)); save({ [id]: isOn(id) }); };
@@ -884,7 +892,11 @@ function syncNow(pull = false) {
   syncing = (async () => {
     try {
       await pushPending();
-      if (pull) { await pullRemote(); if (!$('library').hidden) renderLibrary(); }
+      if (pull) {
+        await pullRemote();
+        await syncScores();  // 악보가 실패해도 기록은 먼저 받아 둔다
+        if (!$('library').hidden) renderLibrary();
+      }
       lastSync = Date.now(); pref('lastSync', String(lastSync)); syncError = '';
     } catch (e) { syncError = sync.errorText(e); }
     finally { syncing = null; renderAccount(); }
@@ -892,6 +904,64 @@ function syncNow(pull = false) {
   return syncing;
 }
 const syncSoon = () => flushPractice().then(() => syncNow());
+
+// 악보: 이 기기에만 있는 곡은 올리고, 서버에만 있는 곡은 받는다. bpm·순서·박자 설정은 나중에 바꾼 쪽을 따른다.
+// 한 기기에서 지운 곡은 서버에 「지움」 표시를 남겨 다른 기기에서도 지운다 (연습 기록은 남긴다).
+const isHash = k => /^[0-9a-f]{64}$/.test(k);
+const isOpen = s => !!(M && rec && rec.id === s.id);
+const scoreMeta = s => ({ title: s.title, bpm: s.bpm, order: s.order, click: s.click !== false, countin: s.countin !== false,
+                          added: s.added || 0, updated: s.updated || s.added || 0 });
+const META_KEYS = ['title', 'bpm', 'order', 'click', 'countin'];
+function queueScoreDelete(key) {
+  if (!isHash(key)) return;
+  const q = JSON.parse(pref('scoreDeletes') || '[]');
+  if (!q.includes(key)) pref('scoreDeletes', JSON.stringify([...q, key]));
+  syncNow(true);
+}
+async function syncScores() {
+  const uid = user.uid, busy = $('busy');
+  // 지운 곡 먼저 알린다. 안 그러면 서버에서 도로 받아 온다
+  const dq = JSON.parse(pref('scoreDeletes') || '[]');
+  for (const k of dq) await sync.deleteScore(uid, k);
+  if (dq.length) pref('scoreDeletes', JSON.stringify(JSON.parse(pref('scoreDeletes') || '[]').filter(k => !dq.includes(k))));
+
+  const server = new Map((await sync.listScores(uid)).map(x => [x.key, x]));
+  const local = new Map();
+  for (const s of await allScores()) { const k = await ensureHash(s); if (!local.has(k)) local.set(k, []); local.get(k).push(s); }
+  let changed = false;
+  for (const [k, list] of local) {
+    if (!isHash(k)) continue;
+    const s = list[0], srv = server.get(k), lu = s.updated || s.added || 0;
+    if (!srv) { await sync.uploadScore(uid, k, s.pdf, scoreMeta(s)); continue; }
+    if (srv.deleted) {
+      // 다른 기기가 지운 뒤에 이 기기에서 새로 넣었으면 다시 올리고, 아니면 여기서도 지운다
+      if ((s.added || 0) > (srv.deletedAt || 0)) await sync.uploadScore(uid, k, s.pdf, scoreMeta(s));
+      else if (!list.some(isOpen)) { for (const x of list) await delScore(x.id); changed = true; }
+      continue;
+    }
+    if ((srv.updated || 0) > lu) {
+      for (const x of list) {
+        if (isOpen(x)) continue;  // 지금 열려 있는 곡은 건드리지 않는다
+        for (const m of META_KEYS) if (srv[m] !== undefined) x[m] = srv[m];
+        x.updated = srv.updated; await putScore(x);
+      }
+      changed = true;
+    } else if (lu > (srv.updated || 0)) await sync.putScoreMeta(uid, k, scoreMeta(s));
+  }
+  for (const srv of server.values()) {
+    if (srv.deleted || local.has(srv.key) || !isHash(srv.key)) continue;
+    busy.hidden = false; busy.textContent = `다른 기기의 악보 받는 중… 「${srv.title}」`;
+    try {
+      const buf = await sync.downloadScore(uid, srv.key, srv.chunks || 1);
+      if (await pdfHash(buf) !== srv.key) continue;  // 받다가 깨졌으면 다음에 다시
+      const extra = { added: srv.added || Date.now(), updated: srv.updated || 0 };
+      for (const m of META_KEYS) if (srv[m] !== undefined) extra[m] = srv[m];
+      await importPdf(buf, srv.title || '악보', extra);
+      changed = true;
+    } finally { busy.hidden = true; busy.textContent = ''; }
+  }
+  return changed;
+}
 let lastPull = 0;
 // 보관함을 다시 볼 때마다 서버를 부르지 않도록 1분에 한 번만
 function pullIfStale() { if (Date.now() - lastPull > 60000) { lastPull = Date.now(); syncNow(true); } }
